@@ -18,10 +18,14 @@ import (
 	"github.com/google/syzkaller/pkg/aflow/backend"
 	"github.com/google/syzkaller/pkg/aflow/syzspec"
 	"github.com/google/syzkaller/pkg/aflow/trajectory"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"golang.org/x/sync/errgroup"
 )
+
+// LogFunc is a leveled printf-style logger with the same signature as log.Logf.
+type LogFunc func(v int, msg string, args ...any)
 
 // ExecuteOptions groups the execution environment and infrastructure limits for a workflow run.
 type ExecuteOptions struct {
@@ -31,6 +35,7 @@ type ExecuteOptions struct {
 	OnEvent    onEvent
 	Debug      bool
 	TokenLimit int
+	Logf       LogFunc
 }
 
 // Execute executes the given AI workflow with provided inputs and returns workflow outputs.
@@ -59,6 +64,7 @@ func (flow *Flow) Execute(ctx context.Context, inputs map[string]any, opts Execu
 		onEvent:     opts.OnEvent,
 		runnerDebug: opts.Debug,
 		tokenLimit:  opts.TokenLimit,
+		logf:        opts.Logf,
 	}
 
 	defer c.Close()
@@ -91,9 +97,9 @@ func (flow *Flow) Execute(ctx context.Context, inputs map[string]any, opts Execu
 	if err := c.finishSpan(span, flowErr); err != nil {
 		return nil, err
 	}
-	if c.spanNesting != 0 {
+	if len(c.activeSpans) != 0 {
 		// Since we finish all spans, even on errors, we should end up at 0.
-		panic(fmt.Sprintf("unbalanced spans (%v)", c.spanNesting))
+		panic(fmt.Sprintf("unbalanced spans (%v)", len(c.activeSpans)))
 	}
 	return span.Results, nil
 }
@@ -195,7 +201,7 @@ type Context struct {
 	state          map[string]any
 	onEvent        onEvent
 	spanSeq        int
-	spanNesting    int
+	activeSpans    []*trajectory.Span
 	runnerMu       sync.Mutex
 	runnerManager  *RunnerManager
 	runnerEg       *errgroup.Group
@@ -204,7 +210,30 @@ type Context struct {
 	tokenLimit     int
 	consumedTokens int64
 	blobs          syzspec.BlobStore
+	logf           LogFunc
 	stubContext
+}
+
+// Logf writes a formatted log message using the workflow's logger.
+func (ctx *Context) Logf(v int, msg string, args ...any) {
+	if ctx.logf != nil {
+		ctx.logf(v, msg, args...)
+	} else {
+		log.Logf(v, msg, args...)
+	}
+}
+
+// RecordArtifact associates an artifact of the given type with the current active span.
+// If the span already has an artifact of this type, it is replaced.
+func (ctx *Context) RecordArtifact(typ trajectory.ArtifactType, data string) {
+	if data == "" || len(ctx.activeSpans) == 0 {
+		return
+	}
+	current := ctx.activeSpans[len(ctx.activeSpans)-1]
+	if current.Artifacts == nil {
+		current.Artifacts = make(map[trajectory.ArtifactType]string)
+	}
+	current.Artifacts[typ] = data
 }
 
 type stubContext struct {
@@ -331,17 +360,23 @@ func (ctx *Context) Close() {
 func (ctx *Context) startSpan(span *trajectory.Span) error {
 	span.Seq = ctx.spanSeq
 	ctx.spanSeq++
-	span.Nesting = ctx.spanNesting
-	ctx.spanNesting++
+	span.Nesting = len(ctx.activeSpans)
 	span.Started = ctx.timeNow()
-	return ctx.onEvent(span)
+	if err := ctx.onEvent(span); err != nil {
+		// Callers don't finish spans that failed to start.
+		return err
+	}
+	ctx.activeSpans = append(ctx.activeSpans, span)
+	return nil
 }
 
 func (ctx *Context) finishSpan(span *trajectory.Span, spanErr error) error {
-	ctx.spanNesting--
-	if ctx.spanNesting < 0 {
+	last := len(ctx.activeSpans) - 1
+	if last < 0 || ctx.activeSpans[last] != span {
 		panic("unbalanced spans")
 	}
+	ctx.activeSpans[last] = nil
+	ctx.activeSpans = ctx.activeSpans[:last]
 	span.Finished = ctx.timeNow()
 	if spanErr != nil {
 		span.Error = spanErr.Error()
@@ -368,7 +403,7 @@ func (ctx *Context) InitRunnerManager(cfg *mgrconfig.Config) (*RunnerManager, er
 	runnerCtx, cancel := context.WithCancel(ctx.Context)
 	eg, egCtx := errgroup.WithContext(runnerCtx)
 
-	rm, err := newRunnerManager(egCtx, cfg, ctx.runnerDebug)
+	rm, err := newRunnerManager(egCtx, cfg, ctx.runnerDebug, ctx.Logf)
 	if err != nil {
 		cancel()
 		return nil, err

@@ -11,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"maps"
 	"net/http"
 	"os"
@@ -20,19 +19,18 @@ import (
 	"strings"
 
 	"github.com/google/syzkaller/pkg/aflow"
-	"github.com/google/syzkaller/pkg/aflow/backend"
 	_ "github.com/google/syzkaller/pkg/aflow/flow"
-	"github.com/google/syzkaller/pkg/aflow/trajectory"
-	aflowhtml "github.com/google/syzkaller/pkg/aflow/trajectory/html"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/tool"
+	"github.com/google/syzkaller/vm"
 	"golang.org/x/oauth2/google"
 )
 
 func main() {
 	var (
 		flagFlow        = flag.String("workflow", "", "workflow to execute")
-		flagInput       = flag.String("input", "", "input json file with workflow arguments")
+		flagInput       = flag.String("input", "", "input JSON file or directory containing task input files")
+		flagParallel    = flag.Int("parallel", 1, "number of parallel workflows to run in batch execution")
 		flagWorkdir     = flag.String("workdir", "", "directory for kernel checkout, kernel builds, etc")
 		flagModel       = flag.String("model", "", "use this LLM model, if empty use default models")
 		flagProvider    = flag.String("provider", "gemini", "LLM provider to use (gemini, vertex)")
@@ -45,143 +43,86 @@ func main() {
 		flagOutput     = flag.String("output", "", "save final workflow output to this JSON file")
 		flagDebug      = flag.Bool("debug", false, "enable runner debug logging")
 		flagTokenLimit = flag.Int("token-limit", 0, "maximum tokens allowed for the workflow run (0 = no limit)")
+		flagCorpus     = flag.String("corpus", "", "save all programs executed in batch execution to this corpus.db")
 	)
 	defer tool.Init()()
 	if *flagDownloadBug != "" {
-		token := ""
-		if *flagAuth {
-			var err error
-			token, err = getAccessToken()
-			if err != nil {
-				tool.Fail(err)
-			}
-		}
-		if err := downloadBug(*flagDownloadBug, *flagInput, token); err != nil {
+		if err := handleDownloadBug(*flagDownloadBug, *flagInput, *flagAuth); err != nil {
 			tool.Fail(err)
 		}
 		return
 	}
-	if *flagFlow == "" {
-		fmt.Fprintf(os.Stderr, "syz-aflow usage:\n")
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "available workflows:\n")
-		for _, flow := range aflow.Flows {
-			fmt.Fprintf(os.Stderr, "\t%v: %v\n", flow.Name, flow.Description)
-		}
+	if *flagFlow == "" || *flagInput == "" {
+		printUsage()
 		return
+	}
+	tasks, isBatch, err := findTaskFiles(*flagInput)
+	if err != nil {
+		tool.Fail(err)
+	}
+	if len(tasks) == 0 {
+		tool.Failf("no task files found in %q", *flagInput)
 	}
 	cacheSize, err := parseSize(*flagCacheSize)
 	if err != nil {
 		tool.Fail(err)
 	}
-	if err := run(context.Background(), RunArgs{
+	args := RunnerArgs{
+		FlowName:   *flagFlow,
 		Provider:   *flagProvider,
 		Model:      *flagModel,
-		FlowName:   *flagFlow,
-		InputFile:  *flagInput,
 		Workdir:    *flagWorkdir,
-		HTMLFile:   *flagHTML,
-		OutputFile: *flagOutput,
 		CacheSize:  cacheSize,
 		Debug:      *flagDebug,
 		TokenLimit: *flagTokenLimit,
-	}); err != nil {
+		Parallel:   *flagParallel,
+		HTML:       *flagHTML,
+		Output:     *flagOutput,
+		Corpus:     *flagCorpus,
+	}
+	if err := validateBatchMode(isBatch, args); err != nil {
+		tool.Fail(err)
+	}
+
+	// On SIGINT/SIGTERM, cancel running workflows and shut down their VMs gracefully.
+	// Aborted batch tasks keep their in-progress files and are resumed first on restart.
+	osutil.HandleInterrupts(vm.Shutdown)
+	ctx := vm.ShutdownCtx()
+	runner, err := newRunner(ctx, args)
+	if err != nil {
+		tool.Fail(err)
+	}
+	if isBatch {
+		err = runner.runBatch(ctx, tasks)
+	} else {
+		err = runner.runSingle(ctx, tasks[0].Path)
+	}
+	runner.Close()
+	if err != nil {
 		tool.Failf("%v", osutil.VerboseMessage(err))
 	}
 }
 
-type RunArgs struct {
-	Provider   string
-	Model      string
-	FlowName   string
-	InputFile  string
-	Workdir    string
-	HTMLFile   string
-	OutputFile string
-	CacheSize  uint64
-	Debug      bool
-	TokenLimit int
+func handleDownloadBug(bugID, inputFile string, useAuth bool) error {
+	token := ""
+	if useAuth {
+		var err error
+		token, err = getAccessToken()
+		if err != nil {
+			return err
+		}
+	}
+	return downloadBug(bugID, inputFile, token)
 }
 
-func run(ctx context.Context, args RunArgs) error {
-	flow := aflow.Flows[args.FlowName]
-	if flow == nil {
-		return fmt.Errorf("workflow %q is not found", args.FlowName)
+func printUsage() {
+	fmt.Fprintf(os.Stderr, "syz-aflow usage:\n")
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr, "available workflows:\n")
+	for _, name := range slices.Sorted(maps.Keys(aflow.Flows)) {
+		flow := aflow.Flows[name]
+		fmt.Fprintf(os.Stderr, "\t%v: %v\n", flow.Name, flow.Description)
 	}
-	inputData, err := os.ReadFile(args.InputFile)
-	if err != nil {
-		return fmt.Errorf("failed to open -input file: %w", err)
-	}
-	var inputs map[string]any
-	if err := json.Unmarshal(inputData, &inputs); err != nil {
-		return err
-	}
-	if err := expandFileInputs(inputs, filepath.Dir(args.InputFile)); err != nil {
-		return err
-	}
-	cache, err := aflow.NewCache(filepath.Join(args.Workdir, "cache"), args.CacheSize)
-	if err != nil {
-		return err
-	}
-
-	var spans []*trajectory.Span
-	spansMap := make(map[int]*trajectory.Span)
-	onEventFunc := func(span *trajectory.Span) error {
-		if _, ok := spansMap[span.Seq]; !ok {
-			spans = append(spans, span)
-		}
-		spansMap[span.Seq] = span
-		if args.HTMLFile != "" {
-			f, err := os.Create(args.HTMLFile)
-			if err != nil {
-				log.Printf("failed to create HTML file: %v", err)
-			} else {
-				if err := aflowhtml.RenderReport(f, spans); err != nil {
-					log.Printf("failed to render trajectory: %v", err)
-				}
-				f.Close()
-			}
-		}
-		if span.Error != "" {
-			return nil
-		}
-		log.Printf("%v", span)
-		return nil
-	}
-
-	var provider backend.Provider
-	factory, ok := providers[args.Provider]
-	if !ok {
-		supported := slices.Sorted(maps.Keys(providers))
-		return fmt.Errorf("unknown provider %q (supported: %v)", args.Provider, supported)
-	}
-	provider, err = factory(ctx, args.Model)
-	if err != nil {
-		return err
-	}
-	defer provider.Close()
-
-	output, err := flow.Execute(ctx, inputs, aflow.ExecuteOptions{
-		Provider:   provider,
-		Workdir:    args.Workdir,
-		Cache:      cache,
-		OnEvent:    onEventFunc,
-		Debug:      args.Debug,
-		TokenLimit: args.TokenLimit,
-	})
-	if err != nil {
-		return err
-	}
-	if args.OutputFile != "" {
-		data, err := json.MarshalIndent(output, "", "\t")
-		if err != nil {
-			return fmt.Errorf("failed to marshal output: %w", err)
-		}
-		if err := osutil.WriteFile(args.OutputFile, data); err != nil {
-			return fmt.Errorf("failed to save output: %w", err)
-		}
-	}
-	return nil
 }
 
 func downloadBug(id, inputFile, token string) error {

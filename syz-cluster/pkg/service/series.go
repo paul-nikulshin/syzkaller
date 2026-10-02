@@ -10,14 +10,23 @@ import (
 	"fmt"
 
 	"cloud.google.com/go/spanner"
+	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
 	"github.com/google/syzkaller/syz-cluster/pkg/blob"
 	"github.com/google/syzkaller/syz-cluster/pkg/db"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 )
 
 // SeriesService is tested in controller/.
+
+// ParallelBlobOps limits the concurrency of GCS/blob storage operations when reading
+// or writing series patches. Sequential uploads of large patch series can time out
+// (e.g. within the Spanner transaction or HTTP request), causing series uploads to fail.
+// Using 32 concurrent goroutines speeds up GCS operations enough to avoid timeouts
+// while keeping resource usage bounded.
+const ParallelBlobOps = 32
 
 type SeriesService struct {
 	sessionRepo *db.SessionRepository
@@ -54,6 +63,13 @@ func (s *SeriesService) getSessionSeries(ctx context.Context, sessionID string,
 }
 
 func (s *SeriesService) UploadSeries(ctx context.Context, series *api.Series) (*api.UploadSeriesResp, error) {
+	// Fast path: don't upload patch bodies for a series we already have.
+	// This is best effort, seriesRepo.Insert() re-checks it atomically.
+	if existing, err := s.seriesRepo.GetByExtID(ctx, series.ExtID); err != nil {
+		return nil, fmt.Errorf("failed to check for an existing series: %w", err)
+	} else if existing != nil {
+		return &api.UploadSeriesResp{Saved: false}, nil
+	}
 	seriesObj := &db.Series{
 		ID:                uuid.NewString(),
 		ExtID:             series.ExtID,
@@ -74,25 +90,31 @@ func (s *SeriesService) UploadSeries(ctx context.Context, series *api.Series) (*
 		}
 		seriesObj.SubjectTags = append(seriesObj.SubjectTags, tag)
 	}
-	err := s.seriesRepo.Insert(ctx, seriesObj, func() ([]*db.Patch, error) {
-		var ret []*db.Patch
-		for _, patch := range series.Patches {
-			// In case of errors, we will waste some space, but let's ignore it for simplicity.
-			// Patches are not super big.
+	// If we fail below the already written blobs are left orphaned. Let's ignore it for simplicity, patches are not super
+	// big.
+	var eg errgroup.Group
+	eg.SetLimit(ParallelBlobOps)
+	patches := make([]*db.Patch, len(series.Patches))
+	for i, patch := range series.Patches {
+		eg.Go(func() error {
 			uri, err := s.blobStorage.Write(bytes.NewReader(patch.Body),
-				"Series", seriesObj.ID, "Patches", fmt.Sprint(patch.Seq))
+				"Series", hash.String(series.ExtID), "Patches", fmt.Sprint(patch.Seq))
 			if err != nil {
-				return nil, fmt.Errorf("failed to upload patch body: %w", err)
+				return fmt.Errorf("failed to upload patch body: %w", err)
 			}
-			ret = append(ret, &db.Patch{
+			patches[i] = &db.Patch{
 				Seq:     int64(patch.Seq),
 				Title:   patch.Title,
 				Link:    patch.Link,
 				BodyURI: uri,
-			})
-		}
-		return ret, nil
-	})
+			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	err := s.seriesRepo.Insert(ctx, seriesObj, patches)
 	if err != nil {
 		if errors.Is(err, db.ErrSeriesExists) {
 			return &api.UploadSeriesResp{Saved: false}, nil
@@ -137,20 +159,30 @@ func (s *SeriesService) getSeries(ctx context.Context,
 		XStable:           series.XStable.StringVal,
 		XKernelTestBranch: series.XKernelTestBranch.StringVal,
 	}
-	for _, patch := range patches {
-		var body []byte
-		if includeBody {
-			body, err = blob.ReadAllBytes(s.blobStorage, patch.BodyURI)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read patch %q: %w", patch.ID, err)
+	var eg errgroup.Group
+	eg.SetLimit(ParallelBlobOps)
+	ret.Patches = make([]api.SeriesPatch, len(patches))
+	for i, patch := range patches {
+		eg.Go(func() error {
+			var body []byte
+			if includeBody {
+				var err error
+				body, err = blob.ReadAllBytes(s.blobStorage, patch.BodyURI)
+				if err != nil {
+					return fmt.Errorf("failed to read patch %q: %w", patch.ID, err)
+				}
 			}
-		}
-		ret.Patches = append(ret.Patches, api.SeriesPatch{
-			Seq:   int(patch.Seq),
-			Title: patch.Title,
-			Link:  patch.Link,
-			Body:  body,
+			ret.Patches[i] = api.SeriesPatch{
+				Seq:   int(patch.Seq),
+				Title: patch.Title,
+				Link:  patch.Link,
+				Body:  body,
+			}
+			return nil
 		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
 	}
 	return ret, nil
 }

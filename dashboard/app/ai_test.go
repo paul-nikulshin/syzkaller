@@ -22,6 +22,7 @@ import (
 	"github.com/google/syzkaller/pkg/aflow/ai"
 	"github.com/google/syzkaller/pkg/aflow/trajectory"
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -1693,6 +1694,29 @@ func TestWorkflowsForBugReproC(t *testing.T) {
 		{name: "commits", mod: func(b *Bug) { b.Commits = []string{"fix"} }},
 		{name: "INFO: prefix", mod: func(b *Bug) { b.Title = "INFO: task hung in foo" }},
 		{
+			name: "panic: prefix (userspace syzkaller panic)",
+			mod:  func(b *Bug) { b.Title = "panic: runtime error: floating point error" },
+		},
+		{
+			name: "go runtime error",
+			mod:  func(b *Bug) { b.Title = "go runtime error: slice bounds out of range" },
+		},
+		{name: "SYZFAIL", mod: func(b *Bug) { b.Title = "SYZFAIL: something failed" }},
+		{name: "SYZFATAL", mod: func(b *Bug) { b.Title = "SYZFATAL: unit test error" }},
+		{name: "build error", mod: func(b *Bug) { b.Title = "bpf build error" }},
+		{name: "boot error", mod: func(b *Bug) { b.Title = "riscv/fixes boot error: can't ssh into the instance" }},
+		{name: "test error", mod: func(b *Bug) { b.Title = "upstream test error: WARNING in __queue_work" }},
+		{name: "no output", mod: func(b *Bug) { b.Title = "no output from test machine" }},
+		{name: "unexpected reboot", mod: func(b *Bug) { b.Title = "unexpected kernel reboot" }},
+		{name: "soft lockup hang", mod: func(b *Bug) { b.Title = "BUG: soft lockup in foo" }},
+		{name: "KCSAN data race", mod: func(b *Bug) { b.Title = "KCSAN: data-race in foo / bar" }},
+		{name: "KCSAN assert", mod: func(b *Bug) { b.Title = "KCSAN: assert: race in foo" }},
+		{
+			name: "kernel panic allowed",
+			mod:  func(b *Bug) { b.Title = "kernel panic: Fatal exception" },
+			want: true,
+		},
+		{
 			name: "INFORMATION prefix allowed",
 			mod:  func(b *Bug) { b.Title = "INFORMATION leak in sys_bar" },
 			want: true,
@@ -1903,4 +1927,27 @@ func TestAutoCreateReproCRateLimit(t *testing.T) {
 	resp = c.pollAIJob(t, fmt.Sprintf("agent-%d", maxAutoReproCJobs), reproCFlow)
 	require.NotEmpty(t, resp.ID)
 	require.Equal(t, string(ai.WorkflowReproC), resp.Workflow)
+}
+
+func TestAutoCreateAIJobUnsupportedArch(t *testing.T) {
+	c := NewSpannerCtx(t)
+	defer c.Close()
+
+	riscvBuild := testBuild(1)
+	riscvBuild.Arch = targets.RiscV64
+	riscvBuild.VMArch = targets.RiscV64
+	c.aiClient.UploadBuild(riscvBuild)
+
+	crash := testCrash(riscvBuild, 1)
+	crash.Title = "KASAN: slab-use-after-free Write in dev_config"
+	c.aiClient.ReportCrash(crash)
+	c.aiClient.pollEmailBug()
+
+	c.advanceTime(49 * time.Hour)
+
+	// Neither repro-c nor assessment-security should be auto-created for riscv64.
+	resp := c.pollAIWorkflow(t, ai.WorkflowReproC)
+	require.Empty(t, resp.ID)
+	resp = c.pollAIWorkflow(t, ai.WorkflowAssessmentSecurity)
+	require.Empty(t, resp.ID)
 }

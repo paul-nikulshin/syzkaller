@@ -164,12 +164,7 @@ func manualAIWorkflows(cfg *Config) []ManualWorkflowSpec {
 				DefaultValue: targets.AMD64,
 				Required:     true,
 				Hidden:       ret[i].Type != ai.WorkflowReproC,
-				// syz-agent does not support other arches at the moment.
-				Options: []string{
-					targets.AMD64,
-					targets.ARM64,
-					targets.I386,
-				},
+				Options:      aiSupportedArches,
 			},
 			ManualWorkflowField{
 				ID:          "ExternalBugID",
@@ -1367,10 +1362,18 @@ func finishIterationJob(ctx context.Context, job *aidb.Job) error {
 		return fmt.Errorf("failed to cast job results: %w", err)
 	}
 	hasPatch := res.PatchDiff != ""
-	hasReplies := len(res.Replies) > 0
+	var replyToIDs []string
+	seen := make(map[string]struct{})
+	for _, r := range res.Replies {
+		if _, ok := seen[r.ReplyTo]; ok || r.ReplyTo == "" {
+			return fmt.Errorf("invalid or duplicate ReplyTo %q", r.ReplyTo)
+		}
+		seen[r.ReplyTo] = struct{}{}
+		replyToIDs = append(replyToIDs, r.ReplyTo)
+	}
 
 	err = aidb.IterationJobDone(ctx, job.ID, args.TargetCommentIDs, job.ParentReportingID.StringVal,
-		hasPatch, hasReplies, func(ns, stage string) bool {
+		hasPatch, replyToIDs, func(ns, stage string) bool {
 			nsCfg := getNsConfig(ctx, ns)
 			if nsCfg == nil || nsCfg.AI == nil {
 				return false
@@ -2017,7 +2020,7 @@ func tryCreateAIJobForBug(ctx context.Context, bug *Bug, bugKey *db.Key, date in
 	reqWorkflows []dashapi.AIWorkflow) (bool, error) {
 	pending, err := pendingWorkflowsForBug(ctx, bug, bugKey)
 	if err != nil {
-		log.Errorf(ctx, "failed to LoadBugJobs for bug %v: %v", bugKey.StringID(), err)
+		log.Errorf(ctx, "failed to get pending workflows for bug %v: %v", bugKey.StringID(), err)
 		return false, nil
 	}
 
@@ -2112,6 +2115,13 @@ func pendingWorkflowsForBug(ctx context.Context, bug *Bug, bugKey *db.Key) ([]st
 			delete(workflows, typ)
 		}
 	}
+	if len(workflows) == 0 {
+		return nil, nil
+	}
+	supported, err := bugHasSupportedAIArch(ctx, bug)
+	if err != nil || !supported {
+		return nil, err
+	}
 	var pending []string
 	for workflow := range workflows {
 		pending = append(pending, string(workflow))
@@ -2120,9 +2130,44 @@ func pendingWorkflowsForBug(ctx context.Context, bug *Bug, bugKey *db.Key) ([]st
 	return pending, nil
 }
 
+// syz-agent does not support other arches at the moment.
+var aiSupportedArches = []string{targets.AMD64, targets.ARM64, targets.ARM, targets.I386}
+
+func bugHasSupportedAIArch(ctx context.Context, bug *Bug) (bool, error) {
+	crash, _, err := findCrashForBug(ctx, bug)
+	if err != nil {
+		return false, err
+	}
+	build, err := loadBuild(ctx, bug.Namespace, crash.BuildID)
+	if err != nil {
+		return false, err
+	}
+	return build.Type != BuildFailed && build.OS == targets.Linux &&
+		slices.Contains(aiSupportedArches, build.Arch), nil
+}
+
 func (bug *Bug) hasRecentPatchCandidate(ctx context.Context, maxAge time.Duration) bool {
 	lastPatch := bug.discussionSummary().LastPatchMessage
 	return !lastPatch.IsZero() && timeSince(ctx, lastPatch) < maxAge
+}
+
+func canAutoReproCBugTitle(title string, typ crash.Type) bool {
+	if strings.HasPrefix(title, "INFO:") ||
+		strings.HasPrefix(title, "panic:") ||
+		strings.HasPrefix(title, "go runtime error") ||
+		strings.Contains(title, "build error") ||
+		strings.Contains(title, "boot error") ||
+		strings.Contains(title, "test error") {
+		return false
+	}
+	if typ.IsKCSAN() {
+		return false
+	}
+	switch typ {
+	case crash.SyzFailure, crash.NoOutput, crash.LostConnection, crash.Hang, crash.UnexpectedReboot:
+		return false
+	}
+	return true
 }
 
 func workflowsForBug(ctx context.Context, bug *Bug, manual bool) map[ai.WorkflowType]bool {
@@ -2159,7 +2204,7 @@ func workflowsForBug(ctx context.Context, bug *Bug, manual bool) map[ai.Workflow
 		// - Must have a crash report, but no existing C reproducer.
 		// - Wait at least 48h for human / syzkaller-native reproducers to arrive.
 		// - Last crash must be within 30 days to ensure the bug is still fresh / relevant.
-		// - Skip non-fatal issues (INFO).
+		// - Skip non-fatal issues (INFO), KCSAN bugs, non-kernel/syzkaller panics, and build/boot/test errors.
 		// - Skip bugs that have recent patch candidates being discussed / tested.
 		nsCfg := getNsConfig(ctx, bug.Namespace)
 		canAutoReproC := nsCfg.AI != nil && nsCfg.AI.AutoReproC &&
@@ -2167,7 +2212,7 @@ func workflowsForBug(ctx context.Context, bug *Bug, manual bool) map[ai.Workflow
 			!bug.HasCRepro && bug.HasReport &&
 			timeSince(ctx, bug.FirstTime) > reproCMinAge &&
 			timeSince(ctx, bug.LastTime) < reproCMaxAge &&
-			!strings.HasPrefix(bug.Title, "INFO:") &&
+			canAutoReproCBugTitle(bug.Title, typ) &&
 			!bug.hasRecentPatchCandidate(ctx, reproCPatchAge)
 		if canAutoReproC {
 			workflows[ai.WorkflowReproC] = true

@@ -3444,7 +3444,7 @@ error:
 
 static void reset_loop_device(const char* loopname)
 {
-	int loopfd = open(loopname, O_RDWR);
+	int loopfd = open(loopname, O_RDONLY);
 	if (loopfd == -1) {
 		debug("reset_loop_device: open failed: %d\n", errno);
 		return;
@@ -3599,10 +3599,11 @@ static long syz_mount_image(
 		goto error_clear_loop;
 	}
 	if (change_dir) {
-		res = chdir(target);
-		if (res == -1) {
+		if (chdir(target) == -1) {
 			debug("syz_mount_image > chdir error: %d\n", errno);
 			err = errno;
+			close(res);
+			res = -1;
 		}
 	}
 
@@ -5289,7 +5290,7 @@ static void reset_loop()
 #if SYZ_EXECUTOR || __NR_syz_mount_image || __NR_syz_read_part_table
 	char buf[64];
 	snprintf(buf, sizeof(buf), "/dev/loop%llu", procid);
-	int loopfd = open(buf, O_RDWR);
+	int loopfd = open(buf, O_RDONLY);
 	if (loopfd != -1) {
 		ioctl(loopfd, LOOP_CLR_FD, 0);
 		close(loopfd);

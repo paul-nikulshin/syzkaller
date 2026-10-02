@@ -16,11 +16,11 @@ import (
 	"github.com/google/syzkaller/pkg/aflow"
 	"github.com/google/syzkaller/pkg/aflow/action/crash"
 	"github.com/google/syzkaller/pkg/aflow/syzspec"
+	"github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/db"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/hash"
-	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/symbolizer"
 	"github.com/google/syzkaller/prog"
@@ -77,18 +77,23 @@ func executeCorpusAction(ctx *aflow.Context, args ExecuteCorpusArgs) (ExecuteCor
 		return ExecuteCorpusResult{}, fmt.Errorf("unknown sys target: %s/%s", args.TargetOS, args.TargetArch)
 	}
 
-	corpusDB, err := db.OpenReadOnly(args.CorpusPath)
+	kernelPath := filepath.Join(args.KernelObj, filepath.FromSlash(build.LinuxKernelImage(args.TargetArch)))
+	kernelSig, err := hash.File(kernelPath)
 	if err != nil {
-		return ExecuteCorpusResult{}, fmt.Errorf("failed to open corpus db: %w", err)
-	}
-	sortedKeys := slices.Sorted(maps.Keys(corpusDB.Records))
-	if len(sortedKeys) == 0 {
-		return ExecuteCorpusResult{}, nil
+		return ExecuteCorpusResult{}, fmt.Errorf("failed to hash kernel image: %w", err)
 	}
 
-	desc := fmt.Sprintf("corpus-execution-v1-%v-%v", args.KernelCommit, corpusSig)
+	desc := fmt.Sprintf("corpus-execution-v2-%v-%v", kernelSig.String(), corpusSig)
 	dir, err := ctx.Cache("corpus-execution", desc, func(dir string) error {
-		log.Logf(1, "aflow: executing corpus from %q (%d programs)", args.CorpusPath, len(sortedKeys))
+		corpusDB, err := db.OpenReadOnly(args.CorpusPath)
+		if err != nil {
+			return fmt.Errorf("failed to open corpus db: %w", err)
+		}
+		sortedKeys := slices.Sorted(maps.Keys(corpusDB.Records))
+		if len(sortedKeys) == 0 {
+			return osutil.WriteJSON(filepath.Join(dir, "index.json"), syzspec.CorpusData{})
+		}
+		ctx.Logf(1, "aflow: executing corpus from %q (%d programs)", args.CorpusPath, len(sortedKeys))
 		// Preserve custom VM settings (memory, QEMU flags, disk images) while setting instance count.
 		var vmConfig map[string]any
 		if len(args.VM) > 0 {
@@ -131,17 +136,18 @@ func executeCorpusAction(ctx *aflow.Context, args ExecuteCorpusArgs) (ExecuteCor
 			return fmt.Errorf("failed to build config: %w", err)
 		}
 
-		err = aflow.RunIsolatedManager(ctx.Context, cfg, false, func(mgrCtx context.Context, rm *aflow.RunnerManager) error {
-			return streamExecuteCorpus(mgrCtx, rm, streamCorpusParams{
-				dir:        dir,
-				records:    corpusDB.Records,
-				sortedKeys: sortedKeys,
-				target:     target,
-				sysTarget:  sysTarget,
-				vmType:     args.Type,
-				kernelObj:  args.KernelObj,
+		err = aflow.RunIsolatedManager(ctx.Context, cfg, false, ctx.Logf,
+			func(mgrCtx context.Context, rm *aflow.RunnerManager) error {
+				return streamExecuteCorpus(mgrCtx, rm, streamCorpusParams{
+					dir:        dir,
+					records:    corpusDB.Records,
+					sortedKeys: sortedKeys,
+					target:     target,
+					sysTarget:  sysTarget,
+					vmType:     args.Type,
+					kernelObj:  args.KernelObj,
+				})
 			})
-		})
 		if err != nil {
 			return fmt.Errorf("failed to execute corpus: %w", err)
 		}
@@ -366,7 +372,7 @@ func (s *corpusStreamer) feedPrograms(ctx context.Context) error {
 		rec := s.params.records[k]
 		p, err := s.params.target.Deserialize(rec.Val, prog.NonStrict)
 		if err != nil {
-			log.Logf(1, "aflow: failed to deserialize program %s: %v", k, err)
+			s.rm.Logf(1, "aflow: failed to deserialize program %s: %v", k, err)
 			continue
 		}
 		pData := p.Serialize()
@@ -446,7 +452,7 @@ func (s *corpusStreamer) processBatch(batch []completedProg, executedCount int) 
 	if err := symbolizeBatchCoverage(s.symb, s.vmlinux, pcToHashes, s.pcCache, s.indexBuilder); err != nil {
 		return err
 	}
-	log.Logf(2, "aflow: %d/%d executed", executedCount, len(s.params.sortedKeys))
+	s.rm.Logf(2, "aflow: %d/%d executed", executedCount, len(s.params.sortedKeys))
 	return nil
 }
 
